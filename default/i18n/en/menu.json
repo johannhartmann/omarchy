@@ -833,6 +833,9 @@
   "install.ai.chatgpt": {
     "label": "ChatGPT Desktop"
   },
+  "install.ai.antigravity": {
+    "label": "Antigravity Desktop"
+  },
   "install.ai.claude": {
     "label": "Claude Desktop"
   },
@@ -1048,6 +1051,9 @@
   },
   "remove.ai.chatgpt": {
     "label": "ChatGPT Desktop"
+  },
+  "remove.ai.antigravity": {
+    "label": "Antigravity Desktop"
   },
   "remove.ai.claude": {
     "label": "Claude Desktop"

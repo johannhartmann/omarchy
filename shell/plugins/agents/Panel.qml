@@ -243,7 +243,8 @@ Panel {
   readonly property var addProviders: [
     { providerId: "claude", providerName: "Claude Code" },
     { providerId: "codex", providerName: "Codex" },
-    { providerId: "grok", providerName: "Grok" }
+    { providerId: "grok", providerName: "Grok" },
+    { providerId: "agy", providerName: "Antigravity", nativeSignin: true }
   ]
   property string addStage: ""
   property string addProvider: ""
@@ -271,6 +272,10 @@ Panel {
   }
 
   function chooseAddProvider(id) {
+    if (id === "agy") {
+      launchAntigravitySignIn()
+      return
+    }
     var state = addChecks[id] || ""
     if (state === "") return
     addProvider = id
@@ -439,6 +444,10 @@ Panel {
   // add view just like adding one.
   function signInAgain(p, account) {
     if (!p || addStage === "running") return
+    if (p.providerId === "agy") {
+      launchAntigravitySignIn()
+      return
+    }
     addProvider = p.providerId
     addPrivate = !!account && account.primary !== true
     addStatus = Commons.I18n.t("agents.starting")
@@ -478,6 +487,14 @@ Panel {
 
   function launchAgent() {
     if (root.bar) root.bar.run("omarchy-agent --pick")
+    root.close()
+  }
+
+  // AGY shares the system keyring with its desktop and IDE extensions. Let
+  // its native onboarding own sign-in instead of offering isolated accounts.
+  function launchAntigravitySignIn() {
+    root.bar.run("omarchy-agent-signin-agy")
+    root.addStage = ""
     root.close()
   }
 
@@ -652,6 +669,8 @@ Panel {
       return Commons.I18n.t("agents.helpRunToAuthenticate").arg("`codex login`")
     case "Start Grok, or run `grok login`, to sign in.":
       return Commons.I18n.t("agents.helpStartOrRunToSignIn").arg("Grok").arg("`grok login`")
+    case "Start Antigravity with `agy` to sign in.":
+      return Commons.I18n.t("agents.helpStartToSignIn").arg("Antigravity").arg("`agy`")
     case "Start Grok to see its limits; signing in again is not needed.":
       return Commons.I18n.t("agents.helpStartToSeeLimits").arg("Grok")
     case "Grok's saved sign-in expired. Start Grok to refresh it.":
@@ -660,6 +679,8 @@ Panel {
       return Commons.I18n.t("agents.helpFireworksSignIn").arg("FIREWORKS_API_KEY").arg("`firectl set-api-key`")
     case "codex not found in PATH":
       return Commons.I18n.t("agents.helpNotInPath").arg("codex")
+    case "agy not found in PATH":
+      return Commons.I18n.t("agents.helpNotInPath").arg("agy")
     case "Fireworks usage scan failed":
       return Commons.I18n.t("agents.helpScanFailed").arg("Fireworks")
     }
@@ -1184,7 +1205,7 @@ Panel {
           id: choice
           required property var modelData
           required property int index
-          readonly property string state: root.addChecks[modelData.providerId] || ""
+          readonly property string state: modelData.nativeSignin === true ? "first" : (root.addChecks[modelData.providerId] || "")
           readonly property bool available: state === "first" || state === "additional"
           readonly property bool hasCursor: root.hasKey("choice", index)
           width: (choiceRow.width - choiceRow.spacing * (root.addProviders.length - 1)) / root.addProviders.length

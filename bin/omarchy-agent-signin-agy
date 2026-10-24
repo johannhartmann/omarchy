@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# omarchy:summary=Open Antigravity's native sign-in in a terminal
+# omarchy:args=[--inline]
+
+set -euo pipefail
+
+case "${1:-}" in
+"")
+  exec omarchy-launch-tui --app-id=org.omarchy.agent omarchy-agent-signin-agy --inline
+  ;;
+--inline)
+  (( $# == 1 )) || { echo "Usage: omarchy-agent-signin-agy [--inline]" >&2; exit 1; }
+  ;;
+*)
+  echo "Usage: omarchy-agent-signin-agy [--inline]" >&2
+  exit 1
+  ;;
+esac
+
+# Selecting the default agent would launch with auto-approval and change the
+# user's choice. Sign-in uses AGY's ordinary interactive onboarding instead.
+if omarchy-cmd-missing agy; then
+  if omarchy-mise-default-tools declares antigravity-cli; then
+    mise install antigravity-cli
+  else
+    mise use -g antigravity-cli
+  fi
+fi
+
+[[ $PWD == "$HOME" && -d $HOME/Work ]] && cd "$HOME/Work"
+
+refresh_usage() {
+  omarchy-agent-usage-update --force agy || true
+  omarchy-shell -q omarchy.agents refresh || true
+}
+trap refresh_usage EXIT
+
+echo "Complete Antigravity's sign-in, then exit the CLI to refresh the Agents panel."
+agy

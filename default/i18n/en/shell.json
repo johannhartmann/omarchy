@@ -33,6 +33,7 @@
   "agents.helpSignInExpired": "%1's saved sign-in expired. Start %1 to refresh it.",
   "agents.helpStartOrRunToSignIn": "Start %1, or run %2, to sign in.",
   "agents.helpStartToSeeLimits": "Start %1 to see its limits; signing in again is not needed.",
+  "agents.helpStartToSignIn": "Start %1 with %2 to sign in.",
   "agents.lastUpdatedAgo": "Last updated %1 ago",
   "agents.lastUpdatedJustNow": "Last updated less than a minute ago",
   "agents.lastUpdatedUnknown": "Last updated time unavailable",

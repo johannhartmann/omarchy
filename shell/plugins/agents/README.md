@@ -37,7 +37,7 @@ Every subscription on one page, limits first.
 - **Make something cool** — starter prompts (a new theme, plugin, or app) that
   start the default agent on the task through `omarchy agent prompt`.
 - **Adding a subscription** — the + in the hero's corner swaps the page for
-  Claude Code, Codex, and Grok as large marks, three across, with the first
+  Claude Code, Codex, Grok, and Antigravity as large marks, with the first
   one focused, and the hero's line reads Add an account. The + becomes the
   X that goes back. An agent that can't be added is dimmed and says why on
   hover. A further account asks for a name first, and Enter signs it in. The
@@ -49,7 +49,7 @@ Every subscription on one page, limits first.
 
 The icon is always in the bar. On a machine with no agent yet, the panel is
 the blank slate for setting one up: it opens on the same choice of Claude,
-Codex, or Grok, and the first agent signed in becomes the default agent if
+Codex, Grok, or Antigravity. For Claude, Codex, and Grok, the first agent signed in becomes the default agent if
 none was picked. An agent appears once it is enabled in settings and has
 recorded usage, on this machine or a synced one; a CLI installed
 mid-session shows up at the next refresh. Drop the widget with
@@ -69,9 +69,14 @@ Adding an agent needs no QML changes: ship a collector that prints the record co
 |---|---|---|
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC (rate windows, plus an individual spend cap and its reported reset time when present) | native Codex CLI session files on the built-in `openai` provider (plus pi and opencode sessions) |
+| `agy` | The native `agy -p /usage --output-format json` command | Available prompt history, root conversation summaries, and token transcripts under `~/.gemini/antigravity-cli` |
 | `grok` | The credits endpoint behind Grok's `/usage` view (the billing period's included usage) | Each session's `usage.json` (the ledger `grok usage` prints: tokens by model per finished turn), plus `summary.json` for sessions |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
 | `kimi` | Kimi Code quotas (5-hour session, weekly, and monthly allowances) | none; quota only |
+
+Antigravity's picker entry and Sign-in required link open its native onboarding in a terminal through `omarchy agent signin agy`; exit that CLI to refresh the panel. It uses the shared system keyring, so no additional account, account switching, credential copying, or automatic switching is offered. The existing default agent is unchanged.
+
+AGY's quota probe always asks the native command: the opaque shared keyring provides no supported account identity for reusing a fresh quota cache. A network failure can display the last successful snapshot as stale; an authentication failure clears it. API-key and ADC modes do not probe subscription quotas. Local scan caches are reused for limits-only refreshes and invalidated at midnight; `--force` rescans. Missing history or transcripts leave those statistics empty rather than estimating them from conversation counts. Token dates come from each entry, and unknown models remain unknown. The collector and icons build on [ashxddaga's AGY collector](https://github.com/omacom/omarchy/pull/15056).
 
 When `~/.local/state/omarchy/agents/accounts/<claude|codex|grok>.json`
 registers more than one account, the `claude`, `codex`, and `grok` records

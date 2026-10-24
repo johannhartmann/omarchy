@@ -35,11 +35,39 @@ assert(/text: section\.provider \? \(root\.helpDisplayText\(section\.provider\.a
 assert(/case "Run `codex login` to authenticate\.":\s*return Commons\.I18n\.t\("agents\.helpRunToAuthenticate"\)\.arg\("`codex login`"\)/.test(panelSource), 'known collector help lines are translated at display, commands kept verbatim')
 // A reworded collector line would silently fall back to English, so every
 // fixed help line the collectors cache must still be one the panel maps.
-for (const name of ['claude', 'codex', 'grok', 'fireworks']) {
+for (const name of ['claude', 'codex', 'grok', 'fireworks', 'agy']) {
   const collector = fs.readFileSync(root + '/bin/omarchy-agent-usage-' + name, 'utf8')
   const help = collector.match(/^AUTH_HELP = "([^"]+)"$/m)
   assert(help && panelSource.includes('case ' + JSON.stringify(help[1]) + ':'), name + ' auth help is translated in the panel')
 }
+// Exercise the real handlers with host actions replaced: AGY must never enter
+// account-add/reauth, which assumes isolated credential homes.
+const vm = require('vm')
+function panelFunction(name, context) {
+  const start = panelSource.indexOf('  function ' + name + '(')
+  const next = panelSource.indexOf('\n  function ', start + 1)
+  const source = panelSource.slice(start, next).trim().replace(/\n\s*\/\/[^\n]*/g, '').trim()
+  return vm.runInNewContext('(' + source + ')', context)
+}
+let nativeSignins = 0
+const signinContext = { addStage: '', launchAntigravitySignIn: () => nativeSignins++ }
+panelFunction('chooseAddProvider', signinContext)('agy')
+panelFunction('signInAgain', signinContext)({ providerId: 'agy' }, null)
+assertEqual(nativeSignins, 2, 'picker and expired AGY sign-in use native onboarding instead of account-add')
+const calls = []
+const nativeRoot = { addStage: 'pick', bar: { run: value => calls.push(value) }, close: () => calls.push('close') }
+panelFunction('launchAntigravitySignIn', { root: nativeRoot })()
+assertDeepEqual(calls, ['omarchy-agent-signin-agy', 'close'], 'native onboarding launches once and closes the panel')
+assertEqual(nativeRoot.addStage, '', 'returning from native onboarding restores the usage page')
+const windowContext = { root: { nowMs: 0 } }
+for (const name of ['windowIsLong', 'windowSpanMs', 'windowTitle', 'limitWindow', 'limitWindows', 'scopedPart', 'displayWindows'])
+  windowContext[name] = panelFunction(name, windowContext)
+const agyWindows = windowContext.displayWindows({ limits: [
+  { label: 'Session (5-hour)', title: 'Session', percent: 0.2 },
+  { label: 'Claude and GPT models (5h)', title: 'Claude and GPT models Session', percent: 0.4 }
+] })
+assertEqual(agyWindows.length, 1, 'AGY model groups share the session clock in the existing scoped display')
+assertEqual(agyWindows[0].scoped[0].title, 'Claude and GPT models', 'AGY Claude/GPT quota keeps its model-group identity')
 const mainSource = fs.readFileSync(root + '/shell/plugins/agents/Main.qml', 'utf8')
 assert(/var from = Math\.min\(0\.8, \(threshold - 15\) \/ 100\)/.test(mainSource), 'faster checks start 15 points below the switch threshold')
 assert(/rows\.push\(\[\{ kind: "provider", index: p \}\]\)/.test(panelSource), "every agent's header is a keyboard stop")

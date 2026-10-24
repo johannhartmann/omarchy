@@ -1,0 +1,402 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Antigravity usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--write]
+# omarchy:hidden=true
+"""Collect Google Antigravity (agy) usage into one display-ready JSON record.
+
+Local stats come from ~/.gemini/antigravity-cli/history.jsonl (prompts),
+conversation_summaries.db (sessions), and transcript logs (tokens). Limits come
+from the native /usage command. Adapted from ashxddaga's Omarchy PR #15056:
+https://github.com/omacom/omarchy/pull/15056
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import closing
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "agy"
+AGENT_NAME = "Antigravity"
+AUTH_HELP = "Start Antigravity with `agy` to sign in."
+PROBE_TIMEOUT_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+
+def is_lazy_launcher(path: str) -> bool:
+  # Usage must never run an install-on-first-use stub or a mise shim.
+  try:
+    resolved = Path(path).resolve()
+    if resolved.name in {"mise", "mise-dummy"}:
+      return True
+    with resolved.open("rb") as handle:
+      head = handle.read(2048)
+    return b"mise use" in head or b"mise x " in head or b"mise exec" in head
+  except OSError:
+    return True
+
+
+def get_agy_bin() -> str | None:
+  for directory in os.environ.get("PATH", "").split(os.pathsep):
+    candidate = str(Path(directory) / "agy")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and not is_lazy_launcher(candidate):
+      return candidate
+  mise = shutil.which("mise")
+  if mise:
+    try:
+      result = subprocess.run([mise, "which", "agy"], capture_output=True, text=True,
+                              env=dict(os.environ, MISE_OFFLINE="1"), timeout=10)
+      candidate = result.stdout.strip()
+      if result.returncode == 0 and os.path.isfile(candidate) and os.access(candidate, os.X_OK) and not is_lazy_launcher(candidate):
+        return candidate
+    except (OSError, subprocess.TimeoutExpired):
+      pass
+  return None
+
+
+def read_json(path: Path) -> Any:
+  try:
+    return json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    return None
+
+
+def cache_file(agy_dir: Path, kind: str) -> Path:
+  # The opaque shared keyring has no supported account identity API. Always
+  # ask /usage afresh; these snapshots are only a fallback for network errors,
+  # never proof of a current sign-in. Separate data homes don't share caches.
+  digest = hashlib.sha256(str(agy_dir.resolve()).encode()).hexdigest()[:16]
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+  return root / "omarchy" / "agent-usage" / f"agy-{kind}-{digest}.json"
+
+
+def parse_limits(data: Any) -> list[dict[str, Any]]:
+  if not isinstance(data, dict) or data.get("status") != "SUCCESS":
+    raise ValueError("usage unavailable")
+  command = data.get("command") or {}
+  if not isinstance(command, dict) or command.get("name") not in {"usage", "quota"}:
+    raise ValueError("not a native usage response")
+  groups = (command.get("data") or {}).get("groups")
+  if not isinstance(groups, list):
+    raise ValueError("missing quota groups")
+  limits = []
+  for group in groups:
+    if not isinstance(group, dict):
+      continue
+    name = str(group.get("name") or "Antigravity")
+    for bucket in group.get("buckets") or []:
+      if not isinstance(bucket, dict):
+        continue
+      try:
+        remaining = float(bucket["remaining_fraction"])
+      except (KeyError, TypeError, ValueError):
+        continue
+      if not math.isfinite(remaining) or not 0 <= remaining <= 1:
+        continue
+      window = str(bucket.get("window") or "")
+      reset = bucket.get("reset_time") or ""
+      if not local_date_string(reset):
+        reset = ""
+      label = {"5h": "Session (5-hour)", "weekly": "Weekly (7-day)"}.get(window, window or name)
+      if name != "Gemini Models" and window:
+        label = f"{name} ({window})"
+      # The panel otherwise shortens every timed label to Session/Weekly,
+      # losing the distinction between Gemini and Claude/GPT allowances.
+      title = {"5h": "Session", "weekly": "Weekly"}.get(window, label)
+      if name != "Gemini Models" and window in {"5h", "weekly"}:
+        title = f"{name} {title}"
+      limits.append({"label": label, "title": title, "percent": round(1 - remaining, 6), "resetsAt": reset})
+  return limits
+
+
+def probe_authoritative_limits(agy_dir: Path, agy_bin: str | None) -> dict[str, Any]:
+  result = {"limits": [], "stale": False, "fetchedAtMs": 0,
+            "usageStatusText": "Antigravity limits unavailable", "authHelpText": ""}
+  if not agy_bin:
+    result["authHelpText"] = "agy not found in PATH"
+    return result
+  settings = read_json(agy_dir / "settings.json")
+  if (isinstance(settings, dict) and settings.get("modelProvider") == "gemini") or os.environ.get("AGY_ADC_AUTH", "").lower() == "true":
+    result["usageStatusText"] = "Limits paused"
+    return result
+
+  path = cache_file(agy_dir, "limits")
+  try:
+    # Force slash-command expansion even if the user's print-mode setting
+    # disables it: /usage must never become a billable model prompt.
+    proc = subprocess.run([agy_bin, "-p", "/usage", "--output-format", "json",
+                           "--disable-slash-commands=false"],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          env=dict(os.environ, BROWSER="true"), timeout=PROBE_TIMEOUT_SECONDS)
+    try:
+      data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except ValueError:
+      data = {}
+    if proc.returncode == 0:
+      try:
+        limits = parse_limits(data)
+      except (ValueError, TypeError, AttributeError):
+        limits = None
+      if limits is not None:
+        now_ms = round(time.time() * 1000)
+        payload = {"limits": limits, "fetchedAtMs": now_ms}
+        try:
+          write_atomic(path, json.dumps(payload))
+        except OSError:
+          pass
+        return dict(result, **payload, usageStatusText="" if limits else "Antigravity limits unavailable")
+    # Only recognize fixed failure categories. Never expose raw CLI output:
+    # diagnostics can contain authorization URLs or account information.
+    error = (str(data.get("status", "")) + " " + str(data.get("response", "")) + " " + proc.stderr).lower() if isinstance(data, dict) else ""
+  except subprocess.TimeoutExpired:
+    error = "network timeout"
+  except (OSError, ValueError):
+    error = ""
+
+  expired = any(word in error for word in ("token expired", "invalid_grant", "invalid_token"))
+  if expired or any(word in error for word in ("unauthenticated", "not authenticated", "unauthorized", "sign in", "sign-in", "login", "logged in", "credential")):
+    result.update(usageStatusText="Sign-in expired" if expired else "Waiting for auth", authHelpText=AUTH_HELP)
+    try:
+      path.unlink(missing_ok=True)
+    except OSError:
+      pass
+  elif any(word in error for word in ("timeout", "timed out", "network", "connection refused", "connection reset", "no such host", "unavailable")):
+    cached = read_json(path)
+    if isinstance(cached, dict) and isinstance(cached.get("limits"), list):
+      result.update(limits=cached["limits"], stale=bool(cached["limits"]),
+                    fetchedAtMs=cached.get("fetchedAtMs", 0))
+  return result
+
+
+def get_agy_dir() -> Path:
+  return Path.home() / ".gemini" / "antigravity-cli"
+
+
+def local_date_string(value: Any) -> str | None:
+  try:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      if value > 10_000_000_000:
+        value /= 1000.0
+      return dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+    parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.astimezone().strftime("%Y-%m-%d")
+  except (ValueError, TypeError, OverflowError, OSError):
+    return None
+
+
+def json_lines(path: Path):
+  try:
+    with path.open(encoding="utf-8", errors="replace") as handle:
+      for line in handle:
+        try:
+          value = json.loads(line)
+          if isinstance(value, dict):
+            yield value
+        except ValueError:
+          continue
+  except OSError:
+    pass
+
+
+def count(value: Any) -> int:
+  try:
+    return max(0, int(value or 0))
+  except (TypeError, ValueError, OverflowError):
+    return 0
+
+
+def empty_stats(recent_dates: list[str]) -> dict[str, Any]:
+  return {
+    "hasLocalStats": False,
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [{"date": d, "messageCount": 0} for d in recent_dates],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def scan_local_stats(agy_dir: Path, today_str: str, recent_dates: list[str]) -> dict[str, Any]:
+  stats = empty_stats(recent_dates)
+  active_dates: set[str] = set()
+  prompts_by_date: dict[str, int] = {}
+  history_seen = set()
+  for entry in json_lines(agy_dir / "history.jsonl"):
+    day = local_date_string(entry.get("timestamp"))
+    if not day:
+      continue
+    # Replayed history rows must not count twice. Preserve distinct prompts
+    # on the same timestamp by including the entire row when no id exists.
+    key = str(entry.get("id") or json.dumps(entry, sort_keys=True))
+    if key in history_seen:
+      continue
+    history_seen.add(key)
+    active_dates.add(day)
+    stats["totalPrompts"] += 1
+    prompts_by_date[day] = prompts_by_date.get(day, 0) + 1
+  stats["todayPrompts"] = prompts_by_date.get(today_str, 0)
+
+  db_file = agy_dir / "conversation_summaries.db"
+  if db_file.is_file():
+    try:
+      # mode=ro must not create a database or mutate AGY's live summaries.
+      with closing(sqlite3.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+        rows = conn.execute('SELECT conversation_id, last_modified_time FROM conversation_summaries WHERE parent_conversation_id = "" OR parent_conversation_id IS NULL')
+        sessions = {str(row[0]): local_date_string(row[1]) for row in rows}
+        stats["totalSessions"] = len(sessions)
+        stats["todaySessions"] = sum(day == today_str for day in sessions.values())
+        active_dates.update(day for day in sessions.values() if day)
+    except (sqlite3.Error, OSError):
+      pass
+
+  tokens_by_date: dict[str, int] = {}
+  for root, _, files in os.walk(agy_dir / "brain"):
+    if "transcript.jsonl" not in files:
+      continue
+    entries = {}
+    for entry in json_lines(Path(root) / "transcript.jsonl"):
+      if "input_tokens" not in entry and "output_tokens" not in entry:
+        continue
+      # A step can be rewritten as its result arrives; its last token snapshot
+      # replaces earlier snapshots instead of being charged a second time.
+      key = str(entry.get("step_index", entry.get("id", json.dumps(entry, sort_keys=True))))
+      entries[key] = entry
+    for entry in entries.values():
+      inp, out = count(entry.get("input_tokens")), count(entry.get("output_tokens"))
+      cached = min(inp, count(entry.get("cache_read_tokens")))
+      total = inp + out
+      if not total:
+        continue
+      day = local_date_string(entry.get("created_at"))
+      model = str(entry.get("model") or entry.get("model_name") or entry.get("model_id") or "unknown").strip() or "unknown"
+      bucket = stats["modelUsage"].setdefault(model, {
+        "inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+      })
+      # AGY's input count includes cached reads; the widget sums these buckets.
+      bucket["inputTokens"] += inp - cached
+      bucket["outputTokens"] += out
+      bucket["cacheReadInputTokens"] += cached
+      if day:
+        active_dates.add(day)
+        tokens_by_date[day] = tokens_by_date.get(day, 0) + total
+      if day == today_str:
+        stats["todayTotalTokens"] += total
+        stats["todayTokensByModel"][model] = stats["todayTokensByModel"].get(model, 0) + total
+
+  stats["recentDays"] = [{"date": day, "messageCount": tokens_by_date.get(day, 0)} for day in recent_dates]
+  stats["activeDates"] = sorted(active_dates)
+  stats["activeDays"] = len(active_dates)
+  stats["hasLocalStats"] = bool(stats["totalPrompts"] or stats["totalSessions"] or stats["modelUsage"])
+  return stats
+
+
+def cached_local_stats(agy_dir: Path, today_str: str, recent_dates: list[str], max_age: float) -> dict[str, Any]:
+  stats_cache = cache_file(agy_dir, "stats")
+
+  if max_age > 0 and stats_cache.exists():
+    try:
+      with open(stats_cache, "r", encoding="utf-8") as f:
+        data = json.load(f)
+      if (
+        isinstance(data, dict)
+        and isinstance(data.get("stats"), dict)
+        and empty_stats(recent_dates).keys() <= data["stats"].keys()
+        and data.get("agy_dir") == str(agy_dir)
+        and data.get("day") == today_str
+        and (time.time() - float(data.get("at", 0)) < max_age)
+      ):
+        return data.get("stats", {})
+    except Exception:
+      pass
+
+  stats = scan_local_stats(agy_dir, today_str, recent_dates)
+  try:
+    write_atomic(stats_cache, json.dumps({"agy_dir": str(agy_dir), "day": today_str, "at": time.time(), "stats": stats}))
+  except Exception:
+    pass
+
+  return stats
+
+
+def write_atomic(target_path: Path, text: str) -> None:
+  target_path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(prefix=target_path.name + ".", dir=target_path.parent)
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+      f.write(text)
+    os.replace(tmp, target_path)
+  finally:
+    Path(tmp).unlink(missing_ok=True)
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print Antigravity usage record")
+  parser.add_argument("--force", action="store_true", help="Force refresh cache")
+  parser.add_argument("--limits-only", action="store_true", help="Only refresh rate limits")
+  parser.add_argument("--write", action="store_true", help="Atomically write usage JSON to state directory")
+  args = parser.parse_args()
+
+  agy_dir = get_agy_dir()
+  now = dt.datetime.now().astimezone()
+  today_str = now.strftime("%Y-%m-%d")
+  recent_dates = [(now - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+  agy_bin = get_agy_bin()
+  max_age = LIMITS_ONLY_REUSE_SECONDS if (args.limits_only and not args.force) else 0
+  stats = cached_local_stats(agy_dir, today_str, recent_dates, max_age)
+  if agy_bin or stats["hasLocalStats"]:
+    limits_info = probe_authoritative_limits(agy_dir, agy_bin)
+  else:
+    limits_info = {"limits": [], "stale": False, "fetchedAtMs": 0, "usageStatusText": "", "authHelpText": ""}
+
+  ready = bool(limits_info["limits"]) or stats["hasLocalStats"]
+  settings = read_json(agy_dir / "settings.json")
+  model = str(settings.get("model") or "") if isinstance(settings, dict) else ""
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": now.isoformat(),
+    "ready": ready,
+    "tierLabel": (model or "Antigravity") if ready else "",
+    "usageStatusText": limits_info["usageStatusText"],
+    "authHelpText": limits_info["authHelpText"],
+    "limits": limits_info["limits"],
+    "limitsStale": limits_info["stale"],
+    "limitsFetchedAt": limits_info["fetchedAtMs"],
+  }
+  record.update(stats)
+
+  rendered = json.dumps(record, indent=2) + "\n"
+  if args.write:
+    state_dir = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    usage_file = state_dir / "omarchy" / "agents" / "usage" / "agy.json"
+    try:
+      write_atomic(usage_file, rendered)
+    except Exception as error:
+      sys.stderr.write(f"omarchy-agent-usage-agy: write failed: {error}\n")
+      return 1
+
+  sys.stdout.write(rendered)
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Remove the Antigravity desktop app, keeping shared sign-in and data
+# omarchy:requires-sudo=true
+
+set -euo pipefail
+
+# The desktop, CLI and IDE extensions share authentication. Removing the app
+# must not log out the CLI or remove its conversations, settings or skills.
+omarchy-pkg-drop antigravity
+
+echo
+echo "Antigravity has been removed. Shared sign-in and data have been kept."

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# omarchy:summary=Install the Antigravity desktop app
+# omarchy:requires-sudo=true
+
+set -euo pipefail
+
+echo "Installing Antigravity..."
+omarchy-pkg-aur-add antigravity
+
+echo "Opening Antigravity..."
+setsid uwsm-app -- /usr/bin/antigravity >/dev/null 2>&1 &
+
+echo
+echo "Antigravity has been installed."
